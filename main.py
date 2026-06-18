@@ -114,12 +114,18 @@ log = logging.getLogger("uvicorn.error")
 # =========================
 # CORS
 # =========================
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
+_CORS_ORIGINS_ENV = os.getenv("CORS_ORIGINS", "")
+_CORS_ORIGINS = [o.strip() for o in _CORS_ORIGINS_ENV.split(",") if o.strip()]
+if not _CORS_ORIGINS:
+    _CORS_ORIGINS = [
         "http://localhost:3000",
         "http://127.0.0.1:3000",
-    ],
+    ]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_CORS_ORIGINS,
+    allow_origin_regex=r"https://.*\.pages\.dev",
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
