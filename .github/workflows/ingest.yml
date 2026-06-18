@@ -1,0 +1,126 @@
+name: Weekly RAG Ingest
+
+on:
+  schedule:
+    # 毎週月曜 3:00 JST（日曜 18:00 UTC）
+    - cron: "0 18 * * 0"
+
+  workflow_dispatch:
+    inputs:
+      max_pages:
+        description: "HTML クロール: 最大ページ数"
+        required: false
+        default: "50"
+      batch_size:
+        description: "バッチサイズ"
+        required: false
+        default: "5"
+      sleep_sec:
+        description: "リクエスト間隔（秒）"
+        required: false
+        default: "1"
+      dry_run:
+        description: "dry-run（DB書き込みをスキップ）"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write   # wp_last_run.json をコミットするために必要
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5.4.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          REQ="$(find . -maxdepth 4 -name requirements.txt | head -n 1)"
+          if [ -z "$REQ" ]; then echo "requirements.txt not found"; exit 1; fi
+          pip install -r "$REQ"
+
+      # ─────────────────────────────────────────
+      # ① HTML クロール（type: html）
+      # ─────────────────────────────────────────
+      - name: Run HTML ingest
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          ING="$(find . -maxdepth 4 -name ingest.py | head -n 1)"
+          SITES_YML="$(dirname "$ING")/sites.yml"
+          if [ ! -f "$SITES_YML" ]; then
+            SITES_YML="$(find . -maxdepth 6 -name sites.yml | head -n 1)"
+          fi
+          if [ -z "$ING" ] || [ -z "$SITES_YML" ]; then
+            echo "ingest.py or sites.yml not found"; exit 1
+          fi
+
+          MAX_PAGES="${{ github.event.inputs.max_pages || '50' }}"
+          BATCH_SIZE="${{ github.event.inputs.batch_size || '5' }}"
+          SLEEP_SEC="${{ github.event.inputs.sleep_sec || '1' }}"
+
+          python "$ING" \
+            --sites-yml "$SITES_YML" \
+            --max-pages "$MAX_PAGES" \
+            --batch-size "$BATCH_SIZE" \
+            --sleep-sec "$SLEEP_SEC"
+
+      # ─────────────────────────────────────────
+      # ② WordPress REST API 差分取り込み（type: wordpress）
+      # ─────────────────────────────────────────
+      - name: Run WordPress differential ingest
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          WP_ING="$(find . -maxdepth 4 -name wp_ingest.py | head -n 1)"
+          SITES_YML="$(dirname "$WP_ING")/sites.yml"
+          if [ ! -f "$SITES_YML" ]; then
+            SITES_YML="$(find . -maxdepth 6 -name sites.yml | head -n 1)"
+          fi
+          if [ -z "$WP_ING" ] || [ -z "$SITES_YML" ]; then
+            echo "wp_ingest.py or sites.yml not found"; exit 1
+          fi
+
+          DRY_RUN_FLAG=""
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            DRY_RUN_FLAG="--dry-run"
+          fi
+
+          python "$WP_ING" --sites-yml "$SITES_YML" $DRY_RUN_FLAG
+
+      # ─────────────────────────────────────────
+      # ③ wp_last_run.json をコミットして永続化
+      # ─────────────────────────────────────────
+      - name: Commit wp_last_run.json
+        run: |
+          LAST_RUN="$(find . -maxdepth 4 -name wp_last_run.json | head -n 1)"
+          if [ -z "$LAST_RUN" ]; then
+            echo "wp_last_run.json が存在しないためスキップ（WordPress サイト未設定 or dry-run）"
+            exit 0
+          fi
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          # 新しい内容を退避 → ファイルをHEADに戻す → pull → 復元してcommit
+          cp "$LAST_RUN" /tmp/wp_last_run_new.json
+          git checkout -- "$LAST_RUN"
+          git pull --rebase origin main
+          cp /tmp/wp_last_run_new.json "$LAST_RUN"
+          git add "$LAST_RUN"
+          git diff --staged --quiet || git commit -m "chore: update wp_last_run.json [skip ci]"
+          git push origin main
